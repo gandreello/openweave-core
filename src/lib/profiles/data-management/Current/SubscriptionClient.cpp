@@ -153,13 +153,10 @@ WEAVE_ERROR SubscriptionClient::Init(Binding * const apBinding, void * const apA
 
 #if WEAVE_CONFIG_ENABLE_WDM_UPDATE
 
+    ReloadCatalog();
+
     err = mUpdateClient.Init(mBinding, this, UpdateEventCallback);
     SuccessOrExit(err);
-
-    if (NULL != mDataSinkCatalog)
-    {
-        mDataSinkCatalog->Iterate(InitUpdatableSinkTrait, this);
-    }
 
 exit:
 #endif // WEAVE_CONFIG_ENABLE_WDM_UPDATE
@@ -2083,14 +2080,19 @@ WEAVE_ERROR SubscriptionClient::MoveInProgressToPending(void)
 
         if ( ! mInProgressUpdateList.AreFlagsSet(i, kFlag_Private))
         {
+            // Note: the application can remove sinks from the catalog
             err = mDataSinkCatalog->Locate(traitPath.mTraitDataHandle, &dataSink);
-            SuccessOrExit(err);
-            err = AddItemPendingUpdateSet(traitPath, dataSink->GetSchemaEngine());
-            SuccessOrExit(err);
-            mInProgressUpdateList.RemoveItemAt(i);
+            if (err == WEAVE_NO_ERROR)
+            {
+                err = AddItemPendingUpdateSet(traitPath, dataSink->GetSchemaEngine());
+                SuccessOrExit(err);
 
-            count++;
+                count++;
+            }
+
         }
+
+        mInProgressUpdateList.RemoveItemAt(i);
     }
 
     // Move the state to Ready only if it was Empty; if the application is adding paths,
@@ -2100,7 +2102,8 @@ WEAVE_ERROR SubscriptionClient::MoveInProgressToPending(void)
         SetPendingSetState(kPendingSetReady);
     }
 
-    // Call clear to remove the private ones as well and anything else.
+    // Call clear to remove anything else skipped by the loop above (e.g. paths
+    // marked failed).
     mInProgressUpdateList.Clear();
 
     mUpdateRequestContext.Reset();
@@ -2122,12 +2125,6 @@ WEAVE_ERROR SubscriptionClient::MovePendingToInProgress(void)
 
     VerifyOrDie(mInProgressUpdateList.IsEmpty());
 
-    // TODO: if we send too many DataElements in the same UpdateRequest, the response
-    // is never received. Untill the problem is rootcaused and fixed, the loop below
-    // limits the number of items transferred to mInProgressUpdateList.
-    // 94 items triggers the problem; 75 does not. Using a value of 50 to be safe (more
-    // DataElements are generated during the encoding).
-
     for (size_t traitInstance = 0; traitInstance < mNumUpdatableTraitInstances; traitInstance++)
     {
         traitInfo = mClientTraitInfoPool + traitInstance;
@@ -2137,13 +2134,16 @@ WEAVE_ERROR SubscriptionClient::MovePendingToInProgress(void)
                 i = mPendingUpdateSet.GetNextValidItem(i, traitInfo->mTraitDataHandle))
         {
             mPendingUpdateSet.GetItemAt(i, traitPath);
-
-            err = mInProgressUpdateList.AddItem(traitPath);
-            SuccessOrExit(err);
-
             mPendingUpdateSet.RemoveItemAt(i);
 
-            count++;
+            // Note: the application can remove sinks from the catalog
+            if (Locate(traitPath.mTraitDataHandle, mDataSinkCatalog))
+            {
+                err = mInProgressUpdateList.AddItem(traitPath);
+                SuccessOrExit(err);
+
+                count++;
+            }
         }
     }
 
@@ -2183,13 +2183,17 @@ void SubscriptionClient::PurgeAndNotifyFailedPaths(WEAVE_ERROR aErr, TraitPathSt
             bool isPrivate = aPathStore.AreFlagsSet(j, kFlag_Private);
 
             aPathStore.GetItemAt(j, traitPath);
+            aPathStore.RemoveItemAt(j);
+
             updatableDataSink = Locate(traitPath.mTraitDataHandle, mDataSinkCatalog);
-            VerifyOrDie(updatableDataSink != NULL);
+            if(updatableDataSink == NULL)
+            {
+                // Note: the application can remove sinks from the catalog
+                continue;
+            }
             updatableDataSink->ClearVersion();
             updatableDataSink->ClearUpdateRequiredVersion();
             updatableDataSink->SetConditionalUpdate(false);
-
-            aPathStore.RemoveItemAt(j);
 
             if (false == isPrivate)
             {
@@ -2514,7 +2518,12 @@ void SubscriptionClient::OnUpdateResponse(WEAVE_ERROR aReason, nl::Weave::Profil
         mInProgressUpdateList.GetItemAt(j, traitPath);
 
         updatableDataSink = Locate(traitPath.mTraitDataHandle, mDataSinkCatalog);
-        VerifyOrExit(updatableDataSink != NULL, err = WEAVE_ERROR_WDM_SCHEMA_MISMATCH);
+        if(updatableDataSink == NULL)
+        {
+            // The application can remove Sinks from the catalogue. Ignore this path.
+            mInProgressUpdateList.RemoveItemAt(j);
+            continue;
+        }
 
         WeaveLogDetail(DataManagement, "item: %zu, profile: %" PRIu32 ", statusCode: 0x% " PRIx16 ", version 0x%" PRIx64 "",
                 j, profileID, statusCode, versionCreated);
@@ -3236,6 +3245,26 @@ exit:
     return;
 }
 
+/**
+ * Iterates over the TraitDataSink catalog to initialize internal
+ * data structures.
+ */
+void SubscriptionClient::ReloadCatalog()
+{
+    LockUpdateMutex();
+
+    mNumUpdatableTraitInstances = 0;
+
+    if (mDataSinkCatalog)
+    {
+        mDataSinkCatalog->Iterate(InitUpdatableSinkTrait, this);
+    }
+
+    WeaveLogDetail(DataManagement, "%s found %u updatable sinks", __func__, mNumUpdatableTraitInstances);
+
+    UnlockUpdateMutex();
+}
+
 void SubscriptionClient::InitUpdatableSinkTrait(void * aDataSink, TraitDataHandle aDataHandle, void * aContext)
 {
     WEAVE_ERROR err = WEAVE_NO_ERROR;
@@ -3249,13 +3278,19 @@ void SubscriptionClient::InitUpdatableSinkTrait(void * aDataSink, TraitDataHandl
     updatableDataSink = static_cast<TraitUpdatableDataSink *>(dataSink);
 
     subClient = static_cast<SubscriptionClient *>(aContext);
-    updatableDataSink->SetSubscriptionClient(subClient);
-    updatableDataSink->SetUpdateEncoder(&subClient->mUpdateEncoder);
-    updatableDataSink->ClearUpdateRequiredVersion();
-    updatableDataSink->SetConditionalUpdate(false);
+
+    if (updatableDataSink->GetSubscriptionClient() != subClient)
+    {
+        updatableDataSink->SetSubscriptionClient(subClient);
+        updatableDataSink->SetUpdateEncoder(&subClient->mUpdateEncoder);
+        updatableDataSink->ClearUpdateRequiredVersion();
+        updatableDataSink->ClearUpdateStartVersion();
+        updatableDataSink->SetConditionalUpdate(false);
+        updatableDataSink->SetPotentialDataLoss(false);
+    }
 
     VerifyOrExit(subClient->mNumUpdatableTraitInstances < WDM_CLIENT_MAX_NUM_UPDATABLE_TRAITS,
-                 err = WEAVE_ERROR_NO_MEMORY);
+            err = WEAVE_ERROR_NO_MEMORY);
 
     traitInstance = subClient->mClientTraitInfoPool + subClient->mNumUpdatableTraitInstances;
     ++(subClient->mNumUpdatableTraitInstances);

@@ -314,6 +314,7 @@ public:
     WEAVE_ERROR SetUpdated(TraitUpdatableDataSink * aDataSink, PropertyPathHandle aPropertyHandle, bool aIsConditional);
     void DiscardUpdates();
     void SuspendUpdateRetries();
+    void ReloadCatalog();
 
     bool IsUpdatePendingOrInProgress() { return (kPendingSetEmpty != mPendingSetState || IsUpdateInProgress()); }
 #endif // WEAVE_CONFIG_ENABLE_WDM_UPDATE
